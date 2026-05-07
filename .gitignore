@@ -1,5 +1,6 @@
 credentials.json
 firebase-service-account.json
+bids.json
 *.xlsx
 scraper_log.txt
 .DS_Store

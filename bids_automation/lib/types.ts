@@ -31,6 +31,7 @@ export interface Bid {
 }
 
 export interface ScorerSettings {
+  companyName: string;
   companyDescription: string;
   services: string;
   preferredCategories: string;
@@ -46,4 +47,25 @@ export interface BidDocument {
   type: DocumentType;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ReferenceFile {
+  id: string;
+  name: string;
+  url: string;
+  storagePath: string;
+  tags: string[];
+  size: number;
+  mimeType: string;
+  uploadedAt: string;
+}
+
+export interface ReferenceProposal {
+  id: string;
+  name: string;
+  url: string;
+  storagePath: string;
+  description: string;
+  contentPreview: string; // first 3000 chars for text files, empty for binary
+  uploadedAt: string;
 }

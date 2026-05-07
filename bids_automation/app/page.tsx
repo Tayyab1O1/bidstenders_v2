@@ -226,9 +226,9 @@ export default function Dashboard() {
         </button>
       </div>
 
-      {/* Batch action bar */}
+      {/* Batch action bar — sticky so it stays visible while scrolling */}
       {selected.size > 0 && (
-        <div className="flex items-center gap-3 mb-4 px-4 py-3 bg-indigo-50 border border-indigo-200 rounded-xl">
+        <div className="sticky top-14 z-40 flex items-center gap-3 mb-4 px-4 py-3 bg-indigo-50 border border-indigo-200 rounded-xl shadow-md">
           <div className="flex items-center gap-2">
             <div className="w-5 h-5 rounded bg-indigo-600 flex items-center justify-center">
               <span className="text-white text-xs font-bold">{selected.size}</span>
@@ -313,14 +313,16 @@ export default function Dashboard() {
                   <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide">Closes</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide">Score</th>
                   <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide">Status</th>
-                  <th className="px-4 py-3" />
+                  <th className="sticky right-0 bg-slate-50 border-l border-slate-200 px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide w-20">
+                    Open
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {filtered.map(bid => (
                   <tr
                     key={bid.id}
-                    className={`transition-colors ${
+                    className={`group transition-colors ${
                       selected.has(bid.id)
                         ? 'bg-indigo-50/70'
                         : 'hover:bg-slate-50'
@@ -353,10 +355,10 @@ export default function Dashboard() {
                     <td className="px-4 py-3.5">
                       <StatusPill status={bid.reviewStatus || 'pending'} />
                     </td>
-                    <td className="px-4 py-3.5 text-right">
+                    <td className={`sticky right-0 border-l border-slate-200 px-4 py-3.5 text-right transition-colors ${selected.has(bid.id) ? 'bg-indigo-50/70' : 'bg-white group-hover:bg-slate-50'}`}>
                       <Link
                         href={`/bids/${bid.id}`}
-                        className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
+                        className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors whitespace-nowrap"
                       >
                         Open
                         <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 5l7 7-7 7" /></svg>

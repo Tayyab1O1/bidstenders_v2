@@ -1,13 +1,16 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import Link from 'next/link';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
-  doc, getDoc, collection, getDocs, addDoc, updateDoc, deleteDoc,
+  doc, getDoc, setDoc, collection, getDocs, addDoc, updateDoc, deleteDoc,
   orderBy, query,
 } from 'firebase/firestore';
-import { db } from '@/lib/firebase';
-import type { Bid, BidDocument, DocumentType, ScorerSettings } from '@/lib/types';
+import { ref as storageRef, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
+import { db, storage } from '@/lib/firebase';
+import type { Bid, BidDocument, DocumentType, ScorerSettings, ReferenceFile, ReferenceProposal } from '@/lib/types';
 
 const DOC_TYPES: { value: DocumentType; label: string }[] = [
   { value: 'proposal', label: 'Proposal' },
@@ -15,6 +18,50 @@ const DOC_TYPES: { value: DocumentType; label: string }[] = [
   { value: 'technical', label: 'Technical Approach' },
   { value: 'custom', label: 'Custom' },
 ];
+
+type ChatMessage = { role: 'user' | 'assistant'; text: string };
+type EditMode = 'preview' | 'edit';
+
+// ── Markdown → Word-like rendering ──────────────────────────────────────────
+const md: React.ComponentProps<typeof ReactMarkdown>['components'] = {
+  h1: ({ children }) => <h1 style={{ fontSize: '1.6rem', fontWeight: 700, color: '#0f172a', marginTop: '1.5rem', marginBottom: '0.75rem', paddingBottom: '0.5rem', borderBottom: '2px solid #e2e8f0', lineHeight: 1.3 }}>{children}</h1>,
+  h2: ({ children }) => <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#1e293b', marginTop: '1.4rem', marginBottom: '0.5rem', lineHeight: 1.35 }}>{children}</h2>,
+  h3: ({ children }) => <h3 style={{ fontSize: '1.05rem', fontWeight: 600, color: '#1e293b', marginTop: '1.1rem', marginBottom: '0.4rem' }}>{children}</h3>,
+  h4: ({ children }) => <h4 style={{ fontSize: '0.95rem', fontWeight: 600, color: '#334155', marginTop: '0.9rem', marginBottom: '0.3rem' }}>{children}</h4>,
+  p: ({ children }) => <p style={{ fontSize: '0.925rem', color: '#374151', marginBottom: '0.85rem', lineHeight: 1.75 }}>{children}</p>,
+  strong: ({ children }) => <strong style={{ fontWeight: 600, color: '#111827' }}>{children}</strong>,
+  em: ({ children }) => <em style={{ fontStyle: 'italic', color: '#374151' }}>{children}</em>,
+  ul: ({ children }) => <ul style={{ listStyleType: 'disc', paddingLeft: '1.5rem', marginBottom: '0.85rem' }}>{children}</ul>,
+  ol: ({ children }) => <ol style={{ listStyleType: 'decimal', paddingLeft: '1.5rem', marginBottom: '0.85rem' }}>{children}</ol>,
+  li: ({ children }) => <li style={{ fontSize: '0.925rem', color: '#374151', lineHeight: 1.7, marginBottom: '0.2rem' }}>{children}</li>,
+  blockquote: ({ children }) => (
+    <blockquote style={{ borderLeft: '4px solid #818cf8', paddingLeft: '1rem', paddingTop: '0.25rem', paddingBottom: '0.25rem', margin: '1rem 0', background: '#f5f3ff', borderRadius: '0 6px 6px 0', fontStyle: 'italic', color: '#4b5563' }}>
+      {children}
+    </blockquote>
+  ),
+  hr: () => <hr style={{ border: 'none', borderTop: '1px solid #e2e8f0', margin: '1.5rem 0' }} />,
+  table: ({ children }) => (
+    <div style={{ overflowX: 'auto', marginBottom: '1rem' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' }}>{children}</table>
+    </div>
+  ),
+  th: ({ children }) => <th style={{ border: '1px solid #cbd5e1', background: '#f1f5f9', padding: '0.5rem 0.75rem', textAlign: 'left', fontWeight: 600, fontSize: '0.8rem', color: '#475569' }}>{children}</th>,
+  td: ({ children }) => <td style={{ border: '1px solid #cbd5e1', padding: '0.5rem 0.75rem', fontSize: '0.875rem', color: '#374151' }}>{children}</td>,
+  pre: ({ children }) => <pre style={{ background: '#1e293b', color: '#e2e8f0', padding: '1rem', borderRadius: '8px', fontSize: '0.8rem', overflowX: 'auto', marginBottom: '1rem', lineHeight: 1.6 }}>{children}</pre>,
+  code: ({ children, className }) => {
+    const isBlock = className?.startsWith('language-');
+    return isBlock
+      ? <code style={{ fontFamily: 'monospace' }}>{children}</code>
+      : <code style={{ background: '#f1f5f9', padding: '0.15rem 0.35rem', borderRadius: '4px', fontSize: '0.8rem', fontFamily: 'monospace', color: '#4f46e5' }}>{children}</code>;
+  },
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function formatSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 function DetailRow({ label, value }: { label: string; value?: string }) {
   if (!value) return null;
@@ -27,35 +74,85 @@ function DetailRow({ label, value }: { label: string; value?: string }) {
 }
 
 function ScoreBar({ score }: { score: number }) {
-  const color = score >= 80 ? 'bg-emerald-500' : score >= 60 ? 'bg-amber-400' : score >= 40 ? 'bg-orange-400' : 'bg-red-400';
-  const textColor = score >= 80 ? 'text-emerald-700' : score >= 60 ? 'text-amber-700' : score >= 40 ? 'text-orange-700' : 'text-red-700';
+  const [color, text] =
+    score >= 80 ? ['bg-emerald-500', 'text-emerald-700']
+    : score >= 60 ? ['bg-amber-400', 'text-amber-700']
+    : score >= 40 ? ['bg-orange-400', 'text-orange-700']
+    : ['bg-red-400', 'text-red-700'];
   return (
     <div>
       <div className="flex items-center justify-between mb-1.5">
         <span className="text-xs font-semibold text-slate-500">AI Match Score</span>
-        <span className={`text-sm font-bold ${textColor}`}>{score}/100</span>
+        <span className={`text-sm font-bold ${text}`}>{score}/100</span>
       </div>
       <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
-        <div className={`h-full rounded-full transition-all ${color}`} style={{ width: `${score}%` }} />
+        <div className={`h-full rounded-full ${color}`} style={{ width: `${score}%` }} />
       </div>
     </div>
   );
 }
 
+// ── Toolbar button ────────────────────────────────────────────────────────────
+function ToolBtn({ label, title, onClick }: { label: string; title: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      title={title}
+      onClick={onClick}
+      className="px-2 py-1 text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-200 rounded transition-colors"
+    >
+      {label}
+    </button>
+  );
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
 export default function BidWorkspace({ bidId }: { bidId: string }) {
   const [bid, setBid] = useState<Bid | null>(null);
   const [documents, setDocuments] = useState<BidDocument[]>([]);
+  const [refFiles, setRefFiles] = useState<ReferenceFile[]>([]);
   const [selectedDoc, setSelectedDoc] = useState<BidDocument | null>(null);
   const [editContent, setEditContent] = useState('');
   const [editTitle, setEditTitle] = useState('');
+  const [editMode, setEditMode] = useState<EditMode>('preview');
+  const [midTab, setMidTab] = useState<'documents' | 'files'>('documents');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [generating, setGenerating] = useState(false);
-  const [refining, setRefining] = useState(false);
-  const [refineInstruction, setRefineInstruction] = useState('');
-  const [newDocType, setNewDocType] = useState<DocumentType>('proposal');
+  const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [expandedView, setExpandedView] = useState(false);
+
+  // Chat
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [newDocType, setNewDocType] = useState<DocumentType>('proposal');
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Upload
+  const [showUploadForm, setShowUploadForm] = useState(false);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadTags, setUploadTags] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages, chatLoading]);
+
+  const chatRef = doc(db, 'bids', bidId, 'chat', 'history');
+
+  async function saveChatHistory(messages: ChatMessage[]) {
+    await setDoc(chatRef, { messages }).catch(() => {});
+  }
+
+  const loadRefFiles = useCallback(async () => {
+    const q = query(collection(db, 'bids', bidId, 'referenceFiles'), orderBy('uploadedAt', 'desc'));
+    const snap = await getDocs(q);
+    return snap.docs.map(d => ({ id: d.id, ...d.data() } as ReferenceFile));
+  }, [bidId]);
 
   const loadDocuments = useCallback(async () => {
     const q = query(collection(db, 'bids', bidId, 'documents'), orderBy('createdAt', 'desc'));
@@ -67,78 +164,180 @@ export default function BidWorkspace({ bidId }: { bidId: string }) {
     async function load() {
       setLoading(true);
       try {
-        const [bidSnap, docs] = await Promise.all([
+        const [bidSnap, docs, files, chatSnap] = await Promise.all([
           getDoc(doc(db, 'bids', bidId)),
           loadDocuments(),
+          loadRefFiles(),
+          getDoc(doc(db, 'bids', bidId, 'chat', 'history')),
         ]);
         if (bidSnap.exists()) setBid({ id: bidSnap.id, ...bidSnap.data() } as Bid);
         setDocuments(docs);
+        setRefFiles(files);
+        if (chatSnap.exists()) setChatMessages((chatSnap.data().messages || []) as ChatMessage[]);
         if (docs.length > 0) {
           setSelectedDoc(docs[0]);
           setEditContent(docs[0].content);
           setEditTitle(docs[0].title);
+          setEditMode('preview');
         }
       } finally {
         setLoading(false);
       }
     }
     load();
-  }, [bidId, loadDocuments]);
+  }, [bidId, loadDocuments, loadRefFiles]);
 
   function selectDoc(d: BidDocument) {
     setSelectedDoc(d);
     setEditContent(d.content);
     setEditTitle(d.title);
-    setRefineInstruction('');
+    setEditMode('preview');
     setError(null);
   }
 
-  async function handleGenerate() {
-    if (!bid) return;
-    setGenerating(true);
+  function startNewDoc() {
+    setSelectedDoc(null);
+    setEditContent('');
+    setEditTitle('');
+    setEditMode('preview');
+    setError(null);
+    setTimeout(() => chatInputRef.current?.focus(), 50);
+  }
+
+  // ── Toolbar formatting ────────────────────────────────────────────────────
+  function insertFormat(wrap?: [string, string], linePrefix?: string) {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const selected = editContent.substring(start, end);
+    let next = editContent;
+    let cursor = end;
+
+    if (linePrefix !== undefined) {
+      const lineStart = editContent.lastIndexOf('\n', start - 1) + 1;
+      next = editContent.substring(0, lineStart) + linePrefix + editContent.substring(lineStart);
+      cursor = start + linePrefix.length;
+    } else if (wrap) {
+      const [before, after] = wrap;
+      next = editContent.substring(0, start) + before + selected + after + editContent.substring(end);
+      cursor = end + before.length + after.length;
+    }
+
+    setEditContent(next);
+    setTimeout(() => { ta.focus(); ta.setSelectionRange(cursor, cursor); }, 0);
+  }
+
+  // ── File upload ───────────────────────────────────────────────────────────
+  async function handleUploadFile() {
+    if (!uploadFile) return;
+    setUploading(true);
     setError(null);
     try {
-      const settingsSnap = await getDoc(doc(db, 'settings', 'scorer'));
-      const settings: Partial<ScorerSettings> = settingsSnap.exists()
-        ? (settingsSnap.data() as ScorerSettings)
-        : {};
-
-      const res = await fetch('/api/generate-document', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ bid, documentType: newDocType, settings }),
-      });
-      if (!res.ok) throw new Error((await res.json()).error || 'Generation failed');
-
-      const { content } = await res.json();
-      const typeLabel = DOC_TYPES.find(t => t.value === newDocType)?.label || 'Document';
+      const path = `bids/${bidId}/references/${Date.now()}_${uploadFile.name}`;
+      const fileRef = storageRef(storage, path);
+      await uploadBytes(fileRef, uploadFile);
+      const url = await getDownloadURL(fileRef);
+      const tags = uploadTags.split(',').map(t => t.trim()).filter(Boolean);
       const now = new Date().toISOString();
-
-      const ref = await addDoc(collection(db, 'bids', bidId, 'documents'), {
-        title: `${typeLabel} — ${bid.bidName || bid.bidNameList}`,
-        content,
-        type: newDocType,
-        createdAt: now,
-        updatedAt: now,
+      const docRef = await addDoc(collection(db, 'bids', bidId, 'referenceFiles'), {
+        name: uploadFile.name, url, storagePath: path, tags,
+        size: uploadFile.size, mimeType: uploadFile.type || 'application/octet-stream', uploadedAt: now,
       });
+      setRefFiles(prev => [{
+        id: docRef.id, name: uploadFile.name, url, storagePath: path,
+        tags, size: uploadFile.size, mimeType: uploadFile.type, uploadedAt: now,
+      }, ...prev]);
+      setUploadFile(null); setUploadTags(''); setShowUploadForm(false);
+    } catch (e: any) { setError(e.message); }
+    finally { setUploading(false); }
+  }
 
-      const newDoc: BidDocument = {
-        id: ref.id,
-        title: `${typeLabel} — ${bid.bidName || bid.bidNameList}`,
-        content,
-        type: newDocType,
-        createdAt: now,
-        updatedAt: now,
-      };
-      setDocuments(prev => [newDoc, ...prev]);
-      selectDoc(newDoc);
+  async function handleDeleteRefFile(file: ReferenceFile) {
+    if (!confirm(`Delete "${file.name}"?`)) return;
+    try {
+      await deleteObject(storageRef(storage, file.storagePath));
+      await deleteDoc(doc(db, 'bids', bidId, 'referenceFiles', file.id));
+      setRefFiles(prev => prev.filter(f => f.id !== file.id));
+    } catch (e: any) { setError(e.message); }
+  }
+
+  // ── Chat ──────────────────────────────────────────────────────────────────
+  async function handleSendChat() {
+    if (!chatInput.trim() || chatLoading || !bid) return;
+    const userMsg = chatInput.trim();
+    setChatInput('');
+    const withUser: ChatMessage[] = [...chatMessages, { role: 'user', text: userMsg }];
+    setChatMessages(withUser);
+    setChatLoading(true);
+    setError(null);
+    let finalMessages = withUser;
+    try {
+      if (selectedDoc) {
+        const settingsSnap = await getDoc(doc(db, 'settings', 'scorer'));
+        const settings = settingsSnap.exists() ? settingsSnap.data() : {};
+        const res = await fetch('/api/refine-document', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: editContent, instructions: userMsg, bid, settings }),
+        });
+        if (!res.ok) throw new Error((await res.json()).error || 'Refinement failed');
+        const { content } = await res.json();
+        setEditContent(content);
+        setEditMode('preview');
+        const assistantMsg: ChatMessage = { role: 'assistant', text: 'Done — document updated. Review it above, then save when ready.' };
+        finalMessages = [...withUser, assistantMsg];
+        setChatMessages(finalMessages);
+      } else {
+        const [settingsSnap, refProposalsSnap] = await Promise.all([
+          getDoc(doc(db, 'settings', 'scorer')),
+          getDocs(collection(db, 'referenceProposals')),
+        ]);
+        const settings: Partial<ScorerSettings> = settingsSnap.exists()
+          ? (settingsSnap.data() as ScorerSettings) : {};
+        const referenceProposals = refProposalsSnap.docs.map(d => d.data() as ReferenceProposal);
+        const mergedSettings = {
+          ...settings,
+          customInstructions: [settings.customInstructions, userMsg].filter(Boolean).join('\n\n'),
+        };
+        const res = await fetch('/api/generate-document', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bid, documentType: newDocType, settings: mergedSettings, referenceProposals }),
+        });
+        if (!res.ok) throw new Error((await res.json()).error || 'Generation failed');
+        const { content } = await res.json();
+        const typeLabel = DOC_TYPES.find(t => t.value === newDocType)?.label || 'Document';
+        const now = new Date().toISOString();
+        const ref = await addDoc(collection(db, 'bids', bidId, 'documents'), {
+          title: `${typeLabel} — ${bid.bidName || bid.bidNameList}`,
+          content, type: newDocType, createdAt: now, updatedAt: now,
+        });
+        const newDoc: BidDocument = {
+          id: ref.id, title: `${typeLabel} — ${bid.bidName || bid.bidNameList}`,
+          content, type: newDocType, createdAt: now, updatedAt: now,
+        };
+        setDocuments(prev => [newDoc, ...prev]);
+        selectDoc(newDoc);
+        const assistantMsg: ChatMessage = {
+          role: 'assistant',
+          text: `${typeLabel} created. Edit it directly or send follow-up instructions to refine it.`,
+        };
+        finalMessages = [...withUser, assistantMsg];
+        setChatMessages(finalMessages);
+      }
     } catch (e: any) {
-      setError(e.message);
+      const errMsg: ChatMessage = { role: 'assistant', text: `Something went wrong: ${(e as Error).message}` };
+      finalMessages = [...withUser, errMsg];
+      setChatMessages(finalMessages);
+      setError((e as Error).message);
     } finally {
-      setGenerating(false);
+      setChatLoading(false);
+      saveChatHistory(finalMessages);
     }
   }
 
+  // ── Save ──────────────────────────────────────────────────────────────────
   async function handleSave() {
     if (!selectedDoc) return;
     setSaving(true);
@@ -146,44 +345,18 @@ export default function BidWorkspace({ bidId }: { bidId: string }) {
     try {
       const now = new Date().toISOString();
       await updateDoc(doc(db, 'bids', bidId, 'documents', selectedDoc.id), {
-        title: editTitle,
-        content: editContent,
-        updatedAt: now,
+        title: editTitle, content: editContent, updatedAt: now,
       });
       const updated = { ...selectedDoc, title: editTitle, content: editContent, updatedAt: now };
       setSelectedDoc(updated);
       setDocuments(prev => prev.map(d => d.id === selectedDoc.id ? updated : d));
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
-    } catch (e: any) {
-      setError(e.message);
-    } finally {
-      setSaving(false);
-    }
+    } catch (e: any) { setError(e.message); }
+    finally { setSaving(false); }
   }
 
-  async function handleRefine() {
-    if (!selectedDoc || !refineInstruction.trim()) return;
-    setRefining(true);
-    setError(null);
-    try {
-      const res = await fetch('/api/refine-document', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: editContent, instructions: refineInstruction, bid }),
-      });
-      if (!res.ok) throw new Error((await res.json()).error || 'Refinement failed');
-      const { content } = await res.json();
-      setEditContent(content);
-      setRefineInstruction('');
-    } catch (e: any) {
-      setError(e.message);
-    } finally {
-      setRefining(false);
-    }
-  }
-
-  async function handleDelete(docId: string) {
+  async function handleDeleteDoc(docId: string) {
     if (!confirm('Delete this document?')) return;
     await deleteDoc(doc(db, 'bids', bidId, 'documents', docId));
     const remaining = documents.filter(d => d.id !== docId);
@@ -198,13 +371,11 @@ export default function BidWorkspace({ bidId }: { bidId: string }) {
 
   async function handleStatusChange(status: 'approved' | 'rejected' | 'pending') {
     if (!bid) return;
-    await updateDoc(doc(db, 'bids', bidId), {
-      reviewStatus: status,
-      updatedAt: new Date().toISOString(),
-    });
+    await updateDoc(doc(db, 'bids', bidId), { reviewStatus: status, updatedAt: new Date().toISOString() });
     setBid(prev => prev ? { ...prev, reviewStatus: status } : null);
   }
 
+  // ── Render ────────────────────────────────────────────────────────────────
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64 gap-3 text-slate-400">
@@ -213,11 +384,9 @@ export default function BidWorkspace({ bidId }: { bidId: string }) {
       </div>
     );
   }
-
   if (!bid) {
     return (
       <div className="flex flex-col items-center justify-center h-64 text-slate-400 gap-3">
-        <svg className="w-12 h-12 text-slate-200" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M9.172 16.172a4 4 0 015.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
         <p className="text-sm text-slate-500">Bid not found</p>
         <Link href="/" className="text-sm text-indigo-600 hover:underline">← Back to Dashboard</Link>
       </div>
@@ -232,41 +401,31 @@ export default function BidWorkspace({ bidId }: { bidId: string }) {
 
   return (
     <div className="flex flex-col" style={{ height: 'calc(100vh - 56px)' }}>
-      {/* Breadcrumb bar */}
+      {/* Breadcrumb */}
       <div className="bg-white border-b border-slate-200 px-6 py-3 flex items-center gap-3 shrink-0">
         <Link href="/" className="flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-800 transition-colors">
           <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
           Dashboard
         </Link>
         <span className="text-slate-300">/</span>
-        <span className="text-sm text-slate-700 font-medium truncate max-w-sm">
-          {bid.bidNumber || bid.bidNumberList}
-        </span>
+        <span className="text-sm text-slate-700 font-medium truncate max-w-sm">{bid.bidNumber || bid.bidNumberList}</span>
         <span className={`ml-auto text-xs font-semibold px-2.5 py-1 rounded-full border capitalize ${statusStyles[bid.reviewStatus] || statusStyles.pending}`}>
           {bid.reviewStatus}
         </span>
       </div>
 
       <div className="flex flex-1 overflow-hidden">
-
-        {/* Left panel — Bid Details */}
+        {/* ── Left: Bid Details ─────────────────────────────────────── */}
         <aside className="w-72 shrink-0 bg-white border-r border-slate-200 overflow-y-auto flex flex-col">
           <div className="p-5 space-y-5">
-            {/* Title */}
             <div>
-              <h1 className="text-sm font-bold text-slate-900 leading-snug">
-                {bid.bidName || bid.bidNameList || bid.title}
-              </h1>
+              <h1 className="text-sm font-bold text-slate-900 leading-snug">{bid.bidName || bid.bidNameList || bid.title}</h1>
               <p className="text-xs text-slate-400 font-mono mt-1">{bid.bidNumber || bid.bidNumberList}</p>
             </div>
-
-            {/* Score */}
             {bid.aiScore !== null && bid.aiScore !== undefined && (
               <div className="bg-slate-50 rounded-xl p-4 space-y-3">
                 <ScoreBar score={bid.aiScore} />
-                {bid.aiScoreReason && (
-                  <p className="text-xs text-slate-600 leading-relaxed">{bid.aiScoreReason}</p>
-                )}
+                {bid.aiScoreReason && <p className="text-xs text-slate-600 leading-relaxed">{bid.aiScoreReason}</p>}
                 {bid.aiScoreHighlights && bid.aiScoreHighlights.length > 0 && (
                   <div>
                     <p className="text-xs font-semibold text-emerald-700 mb-1.5">Strengths</p>
@@ -295,8 +454,6 @@ export default function BidWorkspace({ bidId }: { bidId: string }) {
                 )}
               </div>
             )}
-
-            {/* Details */}
             <dl className="space-y-3.5">
               <DetailRow label="Type" value={bid.bidType} />
               <DetailRow label="Classification" value={bid.bidClassification} />
@@ -307,7 +464,6 @@ export default function BidWorkspace({ bidId }: { bidId: string }) {
               <DetailRow label="Address" value={bid.submissionAddress} />
               <DetailRow label="Public Opening" value={bid.publicOpening} />
             </dl>
-
             {bid.categories && (
               <div>
                 <dt className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">Categories</dt>
@@ -321,131 +477,186 @@ export default function BidWorkspace({ bidId }: { bidId: string }) {
               </div>
             )}
           </div>
-
-          {/* Status actions */}
           <div className="mt-auto p-5 border-t border-slate-100 space-y-2">
             <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Change Status</p>
             <div className="flex gap-2">
-              <button
-                onClick={() => handleStatusChange('approved')}
-                disabled={bid.reviewStatus === 'approved'}
-                className="flex-1 py-2 text-xs font-semibold bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-40 transition-colors"
-              >
+              <button onClick={() => handleStatusChange('approved')} disabled={bid.reviewStatus === 'approved'}
+                className="flex-1 py-2 text-xs font-semibold bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-40 transition-colors">
                 Approve
               </button>
-              <button
-                onClick={() => handleStatusChange('rejected')}
-                disabled={bid.reviewStatus === 'rejected'}
-                className="flex-1 py-2 text-xs font-semibold bg-red-500 text-white rounded-lg hover:bg-red-600 disabled:opacity-40 transition-colors"
-              >
+              <button onClick={() => handleStatusChange('rejected')} disabled={bid.reviewStatus === 'rejected'}
+                className="flex-1 py-2 text-xs font-semibold bg-red-500 text-white rounded-lg hover:bg-red-600 disabled:opacity-40 transition-colors">
                 Reject
               </button>
             </div>
             {bid.reviewStatus !== 'pending' && (
-              <button
-                onClick={() => handleStatusChange('pending')}
-                className="w-full py-2 text-xs font-medium text-slate-500 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors"
-              >
+              <button onClick={() => handleStatusChange('pending')}
+                className="w-full py-2 text-xs font-medium text-slate-500 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors">
                 Reset to Pending
               </button>
             )}
           </div>
         </aside>
 
-        {/* Document list */}
-        <div className="w-56 shrink-0 bg-slate-50 border-r border-slate-200 flex flex-col overflow-hidden">
-          <div className="p-3 border-b border-slate-200 space-y-2">
-            <p className="text-xs font-bold text-slate-500 uppercase tracking-widest">Documents</p>
-            <div className="flex gap-1.5">
-              <select
-                value={newDocType}
-                onChange={e => setNewDocType(e.target.value as DocumentType)}
-                className="flex-1 text-xs border border-slate-300 rounded-md px-2 py-1.5 bg-white text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              >
-                {DOC_TYPES.map(t => (
-                  <option key={t.value} value={t.value}>{t.label}</option>
-                ))}
-              </select>
-              <button
-                onClick={handleGenerate}
-                disabled={generating}
-                title="Generate with AI"
-                className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-bold bg-indigo-600 text-white rounded-md hover:bg-indigo-700 disabled:opacity-50 transition-colors whitespace-nowrap"
-              >
-                {generating ? (
-                  <div className="w-3 h-3 border border-white border-t-transparent rounded-full animate-spin" />
-                ) : (
+        {/* ── Middle: Documents / Files ──────────────────────────────── */}
+        <div className="w-64 shrink-0 bg-slate-50 border-r border-slate-200 flex flex-col overflow-hidden">
+          <div className="flex border-b border-slate-200 bg-white shrink-0">
+            <button onClick={() => setMidTab('documents')}
+              className={`flex-1 py-2.5 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors ${midTab === 'documents' ? 'text-indigo-600 border-b-2 border-indigo-600 bg-white' : 'text-slate-500 hover:text-slate-700'}`}>
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+              Documents
+              {documents.length > 0 && <span className="bg-slate-100 text-slate-500 rounded-full px-1.5 py-0.5 text-xs">{documents.length}</span>}
+            </button>
+            <button onClick={() => setMidTab('files')}
+              className={`flex-1 py-2.5 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors ${midTab === 'files' ? 'text-indigo-600 border-b-2 border-indigo-600 bg-white' : 'text-slate-500 hover:text-slate-700'}`}>
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+              Files
+              {refFiles.length > 0 && <span className="bg-slate-100 text-slate-500 rounded-full px-1.5 py-0.5 text-xs">{refFiles.length}</span>}
+            </button>
+          </div>
+
+          {midTab === 'documents' && (
+            <>
+              <div className="px-3 py-2.5 border-b border-slate-200 flex items-center justify-between bg-white shrink-0">
+                <span className="text-xs text-slate-400 font-medium">{documents.length} document{documents.length !== 1 ? 's' : ''}</span>
+                <button onClick={startNewDoc} className="flex items-center gap-1 text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors">
                   <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 4v16m8-8H4" /></svg>
-                )}
-                AI
-              </button>
-            </div>
-          </div>
-          <div className="flex-1 overflow-y-auto p-2 space-y-1">
-            {documents.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-32 text-slate-400 text-center px-3">
-                <svg className="w-8 h-8 text-slate-200 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                <p className="text-xs text-slate-400">No documents yet</p>
+                  New
+                </button>
               </div>
-            ) : (
-              documents.map(d => (
-                <div
-                  key={d.id}
-                  onClick={() => selectDoc(d)}
-                  className={`group relative p-2.5 rounded-lg cursor-pointer transition-all ${
-                    selectedDoc?.id === d.id
-                      ? 'bg-indigo-600 shadow-sm'
-                      : 'bg-white border border-slate-200 hover:border-indigo-200 hover:bg-indigo-50'
-                  }`}
-                >
-                  <p className={`text-xs font-semibold line-clamp-2 pr-4 ${selectedDoc?.id === d.id ? 'text-white' : 'text-slate-800'}`}>
-                    {d.title}
-                  </p>
-                  <p className={`text-xs mt-0.5 capitalize ${selectedDoc?.id === d.id ? 'text-indigo-200' : 'text-slate-400'}`}>
-                    {d.type.replace('_', ' ')}
-                  </p>
-                  <button
-                    onClick={e => { e.stopPropagation(); handleDelete(d.id); }}
-                    className={`absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity text-xs leading-none ${selectedDoc?.id === d.id ? 'text-indigo-200 hover:text-white' : 'text-slate-300 hover:text-red-500'}`}
-                  >
-                    ✕
+              <div className="flex-1 overflow-y-auto p-2 space-y-1">
+                {documents.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center h-32 text-slate-400 text-center px-3">
+                    <p className="text-xs">No documents yet. Use the chat to generate one.</p>
+                  </div>
+                ) : documents.map(d => (
+                  <div key={d.id} onClick={() => selectDoc(d)}
+                    className={`group relative p-2.5 rounded-lg cursor-pointer transition-all ${selectedDoc?.id === d.id ? 'bg-indigo-600 shadow-sm' : 'bg-white border border-slate-200 hover:border-indigo-200 hover:bg-indigo-50'}`}>
+                    <p className={`text-xs font-semibold line-clamp-2 pr-4 ${selectedDoc?.id === d.id ? 'text-white' : 'text-slate-800'}`}>{d.title}</p>
+                    <p className={`text-xs mt-0.5 capitalize ${selectedDoc?.id === d.id ? 'text-indigo-200' : 'text-slate-400'}`}>{d.type.replace('_', ' ')}</p>
+                    <button onClick={e => { e.stopPropagation(); handleDeleteDoc(d.id); }}
+                      className={`absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity text-xs ${selectedDoc?.id === d.id ? 'text-indigo-200 hover:text-white' : 'text-slate-300 hover:text-red-500'}`}>✕</button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {midTab === 'files' && (
+            <>
+              <div className="p-3 border-b border-slate-200">
+                <input ref={fileInputRef} type="file" className="hidden"
+                  onChange={e => { const f = e.target.files?.[0]; if (f) { setUploadFile(f); setShowUploadForm(true); } e.target.value = ''; }} />
+                {!showUploadForm ? (
+                  <button onClick={() => fileInputRef.current?.click()}
+                    className="w-full flex items-center justify-center gap-2 py-2 text-xs font-semibold text-indigo-600 border border-dashed border-indigo-300 rounded-lg hover:bg-indigo-50 transition-colors">
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+                    Upload Reference File
                   </button>
-                </div>
-              ))
-            )}
-          </div>
+                ) : (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 p-2 bg-white border border-slate-200 rounded-lg">
+                      <svg className="w-4 h-4 text-slate-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                      <span className="text-xs text-slate-700 font-medium truncate flex-1">{uploadFile?.name}</span>
+                      <span className="text-xs text-slate-400 shrink-0">{uploadFile ? formatSize(uploadFile.size) : ''}</span>
+                    </div>
+                    <input type="text" value={uploadTags} onChange={e => setUploadTags(e.target.value)}
+                      placeholder="Tags: rfp, requirements, budget…"
+                      className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 bg-white text-slate-700 placeholder-slate-400" />
+                    <div className="flex gap-1.5">
+                      <button onClick={handleUploadFile} disabled={uploading}
+                        className="flex-1 py-1.5 text-xs font-semibold bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 flex items-center justify-center gap-1">
+                        {uploading ? <div className="w-3 h-3 border border-white border-t-transparent rounded-full animate-spin" /> : null}
+                        {uploading ? 'Uploading…' : 'Upload'}
+                      </button>
+                      <button onClick={() => { setShowUploadForm(false); setUploadFile(null); setUploadTags(''); }}
+                        className="px-3 py-1.5 text-xs text-slate-500 border border-slate-200 rounded-lg hover:bg-slate-50">
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
+                {refFiles.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center h-32 text-slate-400 text-center px-3">
+                    <svg className="w-8 h-8 text-slate-200 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
+                    <p className="text-xs">No files uploaded yet</p>
+                  </div>
+                ) : refFiles.map(f => (
+                  <div key={f.id} className="bg-white border border-slate-200 rounded-lg p-2.5 group">
+                    <div className="flex items-start gap-2">
+                      <svg className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-semibold text-slate-800 truncate">{f.name}</p>
+                        <p className="text-xs text-slate-400 mt-0.5">{formatSize(f.size)}</p>
+                        {f.tags.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1.5">
+                            {f.tags.map(tag => (
+                              <span key={tag} className="px-1.5 py-0.5 bg-indigo-50 text-indigo-600 text-xs rounded-md font-medium">#{tag}</span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex gap-2 mt-2 pt-2 border-t border-slate-100">
+                      <a href={f.url} target="_blank" rel="noopener noreferrer"
+                        className="flex items-center gap-1 text-xs text-indigo-600 hover:text-indigo-800 font-medium">
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                        Download
+                      </a>
+                      <button onClick={() => handleDeleteRefFile(f)} className="ml-auto text-xs text-slate-300 hover:text-red-500 transition-colors">Delete</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </div>
 
-        {/* Editor */}
+        {/* ── Right: Document + Chat ────────────────────────────────────── */}
         <div className="flex-1 flex flex-col overflow-hidden bg-white">
+
           {selectedDoc ? (
             <>
-              {/* Editor header */}
-              <div className="flex items-center gap-3 px-5 py-3 border-b border-slate-200 bg-white shrink-0">
-                <input
-                  type="text"
-                  value={editTitle}
-                  onChange={e => setEditTitle(e.target.value)}
+              {/* Header */}
+              <div className="flex items-center gap-3 px-5 py-3 border-b border-slate-200 shrink-0">
+                <input type="text" value={editTitle} onChange={e => setEditTitle(e.target.value)}
                   className="flex-1 text-sm font-semibold text-slate-900 border-0 focus:outline-none bg-transparent placeholder-slate-400"
-                  placeholder="Document title"
-                />
+                  placeholder="Document title" />
                 <div className="flex items-center gap-2 shrink-0">
+                  {/* Preview / Edit toggle */}
+                  <div className="flex rounded-md border border-slate-200 overflow-hidden text-xs">
+                    <button
+                      onClick={() => setEditMode('preview')}
+                      className={`px-2.5 py-1 font-medium transition-colors ${editMode === 'preview' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'}`}
+                    >
+                      Preview
+                    </button>
+                    <button
+                      onClick={() => setEditMode('edit')}
+                      className={`px-2.5 py-1 font-medium transition-colors ${editMode === 'edit' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'}`}
+                    >
+                      Edit
+                    </button>
+                  </div>
+                  {/* Expand */}
+                  <button
+                    onClick={() => setExpandedView(true)}
+                    title="Expand document"
+                    className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-md transition-colors"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
+                  </button>
                   {saved && (
                     <span className="flex items-center gap-1 text-xs text-emerald-600 font-semibold">
                       <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
                       Saved
                     </span>
                   )}
-                  <button
-                    onClick={handleSave}
-                    disabled={saving}
-                    className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors"
-                  >
-                    {saving ? (
-                      <div className="w-3 h-3 border border-white border-t-transparent rounded-full animate-spin" />
-                    ) : (
-                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" /></svg>
-                    )}
+                  <button onClick={handleSave} disabled={saving}
+                    className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors">
+                    {saving ? <div className="w-3 h-3 border border-white border-t-transparent rounded-full animate-spin" /> : null}
                     Save
                   </button>
                 </div>
@@ -458,54 +669,175 @@ export default function BidWorkspace({ bidId }: { bidId: string }) {
                 </div>
               )}
 
-              {/* Textarea */}
-              <textarea
-                value={editContent}
-                onChange={e => setEditContent(e.target.value)}
-                className="flex-1 px-6 py-4 text-sm text-slate-800 font-mono resize-none focus:outline-none leading-relaxed placeholder-slate-300"
-                placeholder="Start writing, or use AI Generate to create a first draft…"
-                style={{ minHeight: 0 }}
-              />
-
-              {/* AI Refine bar */}
-              <div className="border-t border-slate-200 px-5 py-4 bg-slate-50 shrink-0">
-                <div className="flex items-center gap-2 mb-2">
-                  <svg className="w-3.5 h-3.5 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
-                  <span className="text-xs font-semibold text-slate-600">AI Refine</span>
+              {/* Document body */}
+              {editMode === 'preview' ? (
+                /* ── Word-like preview ── */
+                <div className="flex-1 overflow-y-auto bg-slate-100 px-6 py-6" style={{ minHeight: 0 }}>
+                  <div className="max-w-3xl mx-auto bg-white shadow-md rounded-lg px-12 py-10 min-h-full">
+                    {editContent ? (
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={md}>
+                        {editContent}
+                      </ReactMarkdown>
+                    ) : (
+                      <p className="text-slate-300 text-sm italic">No content yet — use the chat below to generate a draft.</p>
+                    )}
+                  </div>
                 </div>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={refineInstruction}
-                    onChange={e => setRefineInstruction(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleRefine()}
-                    placeholder="e.g. Make it more concise, add a pricing section, strengthen the executive summary…"
-                    className="flex-1 px-3 py-2 text-xs text-slate-800 placeholder-slate-400 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white"
+              ) : (
+                /* ── Edit mode ── */
+                <div className="flex-1 flex flex-col overflow-hidden" style={{ minHeight: 0 }}>
+                  {/* Formatting toolbar */}
+                  <div className="flex items-center gap-0.5 px-3 py-1.5 border-b border-slate-200 bg-slate-50 flex-wrap shrink-0">
+                    <ToolBtn label="B" title="Bold" onClick={() => insertFormat(['**', '**'])} />
+                    <ToolBtn label="I" title="Italic" onClick={() => insertFormat(['*', '*'])} />
+                    <span className="w-px h-4 bg-slate-200 mx-1" />
+                    <ToolBtn label="H1" title="Heading 1" onClick={() => insertFormat(undefined, '# ')} />
+                    <ToolBtn label="H2" title="Heading 2" onClick={() => insertFormat(undefined, '## ')} />
+                    <ToolBtn label="H3" title="Heading 3" onClick={() => insertFormat(undefined, '### ')} />
+                    <span className="w-px h-4 bg-slate-200 mx-1" />
+                    <ToolBtn label="• List" title="Bullet list" onClick={() => insertFormat(undefined, '- ')} />
+                    <ToolBtn label="1. List" title="Numbered list" onClick={() => insertFormat(undefined, '1. ')} />
+                    <ToolBtn label="❝" title="Blockquote" onClick={() => insertFormat(undefined, '> ')} />
+                    <span className="w-px h-4 bg-slate-200 mx-1" />
+                    <ToolBtn label="— HR" title="Horizontal rule" onClick={() => {
+                      const ta = textareaRef.current;
+                      if (!ta) return;
+                      const pos = ta.selectionStart;
+                      const next = editContent.substring(0, pos) + '\n---\n' + editContent.substring(pos);
+                      setEditContent(next);
+                      setTimeout(() => { ta.focus(); ta.setSelectionRange(pos + 5, pos + 5); }, 0);
+                    }} />
+                  </div>
+                  <textarea
+                    ref={textareaRef}
+                    value={editContent}
+                    onChange={e => setEditContent(e.target.value)}
+                    className="flex-1 px-6 py-4 text-sm text-slate-800 font-mono resize-none focus:outline-none leading-relaxed placeholder-slate-300 bg-white"
+                    placeholder="Write markdown here…"
+                    style={{ minHeight: 0 }}
                   />
-                  <button
-                    onClick={handleRefine}
-                    disabled={refining || !refineInstruction.trim()}
-                    className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors whitespace-nowrap"
-                  >
-                    {refining ? (
-                      <div className="w-3 h-3 border border-white border-t-transparent rounded-full animate-spin" />
-                    ) : null}
-                    {refining ? 'Refining…' : 'Refine'}
-                  </button>
                 </div>
-              </div>
+              )}
             </>
           ) : (
+            /* No document selected */
             <div className="flex-1 flex flex-col items-center justify-center text-slate-400 p-8">
               <svg className="w-12 h-12 text-slate-200 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
               <p className="text-sm font-medium text-slate-500">No document selected</p>
               <p className="text-xs text-slate-400 mt-1 text-center max-w-xs">
-                Choose a document type and click <strong className="text-slate-500">+ AI</strong> to generate a first draft, or select an existing document.
+                Pick a document type and describe what you need in the chat below.
               </p>
             </div>
           )}
+
+          {/* ── Chat panel ──────────────────────────────────────────────── */}
+          <div className="border-t border-slate-200 flex flex-col bg-slate-50 shrink-0" style={{ height: '240px' }}>
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2.5">
+              {chatMessages.length === 0 && (
+                <p className="text-xs text-slate-400 text-center pt-2">
+                  {selectedDoc
+                    ? 'Describe how to edit this document — AI will apply your instructions.'
+                    : 'Pick a document type and describe what to write — AI will generate a draft.'}
+                </p>
+              )}
+              {chatMessages.map((msg, i) => (
+                <div key={i} className={`flex gap-2 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  {msg.role === 'assistant' && (
+                    <div className="w-5 h-5 rounded-full bg-indigo-100 flex items-center justify-center shrink-0 mt-0.5">
+                      <svg className="w-3 h-3 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                      </svg>
+                    </div>
+                  )}
+                  <div className={`max-w-xs px-3 py-1.5 rounded-2xl text-xs leading-relaxed ${
+                    msg.role === 'user'
+                      ? 'bg-indigo-600 text-white rounded-br-sm'
+                      : 'bg-white border border-slate-200 text-slate-700 rounded-bl-sm'
+                  }`}>
+                    {msg.text}
+                  </div>
+                </div>
+              ))}
+              {chatLoading && (
+                <div className="flex gap-2 justify-start">
+                  <div className="w-5 h-5 rounded-full bg-indigo-100 flex items-center justify-center shrink-0 mt-0.5">
+                    <svg className="w-3 h-3 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                    </svg>
+                  </div>
+                  <div className="bg-white border border-slate-200 rounded-2xl rounded-bl-sm px-3 py-2 flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
+
+            {/* Input row */}
+            <div className="border-t border-slate-200 bg-white px-3 py-2.5 shrink-0">
+              <div className="flex gap-2 items-end">
+                {!selectedDoc && (
+                  <select value={newDocType} onChange={e => setNewDocType(e.target.value as DocumentType)}
+                    className="text-xs border border-slate-300 rounded-lg px-2 py-2 bg-white text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-500 shrink-0">
+                    {DOC_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+                  </select>
+                )}
+                <textarea
+                  ref={chatInputRef}
+                  value={chatInput}
+                  onChange={e => setChatInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendChat(); } }}
+                  placeholder={selectedDoc ? 'Edit instructions… (Enter to send, Shift+Enter for newline)' : 'Describe what to generate… (Enter to send)'}
+                  rows={2}
+                  className="flex-1 px-3 py-2 text-xs text-slate-800 placeholder-slate-400 border border-slate-300 rounded-lg resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white"
+                  style={{ minHeight: 0 }}
+                />
+                <button onClick={handleSendChat} disabled={chatLoading || !chatInput.trim()}
+                  className="p-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40 transition-colors shrink-0">
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+
         </div>
       </div>
+
+      {/* ── Fullscreen document preview ──────────────────────────────── */}
+      {expandedView && (
+        <div className="fixed inset-0 z-50 flex flex-col bg-slate-200">
+          <div className="bg-white border-b border-slate-200 px-8 py-3 flex items-center justify-between shrink-0 shadow-sm">
+            <h2 className="text-sm font-semibold text-slate-800 truncate max-w-2xl">{editTitle}</h2>
+            <div className="flex items-center gap-2">
+              <button onClick={handleSave} disabled={saving}
+                className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors">
+                {saving ? <div className="w-3 h-3 border border-white border-t-transparent rounded-full animate-spin" /> : null}
+                Save
+              </button>
+              <button onClick={() => setExpandedView(false)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-600 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors">
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                Close
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto px-8 py-10">
+            <div className="max-w-4xl mx-auto bg-white shadow-xl rounded-xl px-16 py-14">
+              {editContent ? (
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={md}>{editContent}</ReactMarkdown>
+              ) : (
+                <p className="text-slate-300 text-sm italic">No content yet.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
