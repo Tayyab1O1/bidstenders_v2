@@ -46,8 +46,14 @@ def connect_gsheet():
 
 
 def get_existing_ids(sheet):
-    records = sheet.get_all_records()
-    return set([str(r.get("Bid Number")) for r in records if r.get("Bid Number")])
+    values = sheet.get_all_values()
+    if not values or len(values) < 2:
+        return set()
+    try:
+        bid_col = values[0].index("Bid Number")
+    except ValueError:
+        return set()
+    return set(row[bid_col] for row in values[1:] if len(row) > bid_col and row[bid_col])
 
 
 # ---------------- DETAIL SCRAPER ----------------
