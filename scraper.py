@@ -10,7 +10,7 @@ URL = "https://bidsandtenders.com/bid-opportunities/"
 LOG_FILE = "scraper_log.txt"
 
 CONCURRENCY = 8
-MAX_PAGES = 50
+MAX_PAGES = 10
 
 COLUMNS = [
     "Title", "Bid Number (List)", "Bid Name (List)", "Status (List)",
