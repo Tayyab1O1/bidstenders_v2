@@ -10,7 +10,15 @@ URL = "https://bidsandtenders.com/bid-opportunities/"
 LOG_FILE = "scraper_log.txt"
 
 CONCURRENCY = 8
-MAX_PAGES = 10
+MAX_PAGES = 50
+
+COLUMNS = [
+    "Title", "Bid Number (List)", "Bid Name (List)", "Status (List)",
+    "Posted Date", "Closing Date (List)", "Bid Classification", "Bid Type",
+    "Bid Number", "Bid Name", "Bid Status", "Bid Closing Date (Detail)",
+    "Submission Type", "Submission Address", "Public Opening",
+    "Description", "Categories"
+]
 
 
 # ---------------- LOGGING ----------------
@@ -39,21 +47,40 @@ def connect_gsheet():
         "credentials.json", scope
     )
     client = gspread.authorize(creds)
-
-    # 🔥 PUT YOUR REAL SHEET ID HERE
     sheet = client.open_by_key("1E91ZyuPWuUQYXdWrVMwlofGM8eLlNYCeBfrJj439mBE").worksheet("bidsandtenders")
     return sheet
 
 
-def get_existing_ids(sheet):
-    values = sheet.get_all_values()
-    if not values or len(values) < 2:
-        return set()
-    try:
-        bid_col = values[0].index("Bid Number")
-    except ValueError:
-        return set()
-    return set(row[bid_col] for row in values[1:] if len(row) > bid_col and row[bid_col])
+def upload_to_gsheet(sheet, df):
+    existing_values = sheet.get_all_values()
+
+    if not existing_values:
+        sheet.append_row(COLUMNS)
+        existing_ids = set()
+        sheet_headers = COLUMNS
+    else:
+        sheet_headers = existing_values[0]
+        try:
+            bid_col = sheet_headers.index("Bid Number")
+            existing_ids = set(
+                row[bid_col] for row in existing_values[1:]
+                if len(row) > bid_col and row[bid_col]
+            )
+        except ValueError:
+            existing_ids = set()
+
+    new_rows = []
+    for _, row in df.iterrows():
+        bid_id = str(row.get("Bid Number", ""))
+        if bid_id and bid_id not in existing_ids:
+            aligned = [str(row.get(h, "")) if h in df.columns else "" for h in sheet_headers]
+            new_rows.append(aligned)
+
+    if new_rows:
+        sheet.append_rows(new_rows)
+        log(f"✅ Added {len(new_rows)} rows to Google Sheets")
+    else:
+        log("No new bids found")
 
 
 # ---------------- DETAIL SCRAPER ----------------
@@ -61,7 +88,6 @@ async def extract_detail(context, link, base_data):
     try:
         page = await context.new_page()
 
-        # 🔥 RETRY LOGIC
         for attempt in range(2):
             try:
                 await page.goto(link, timeout=60000)
@@ -135,14 +161,17 @@ async def extract_detail(context, link, base_data):
 # ---------------- SET LIMIT ----------------
 async def set_limit_to_200(frame, page):
     try:
+        await frame.locator("select").first.wait_for(timeout=10000)
         dropdowns = await frame.locator("select").all()
         for dd in dropdowns:
             options = await dd.locator("option").all_text_contents()
             if any(opt.strip() == "200" for opt in options):
                 await dd.select_option(label="200")
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(4000)
+                await frame.locator("table tbody tr").first.wait_for(timeout=15000)
                 log("✅ Limit set to 200")
                 return
+        log("⚠️ Could not find 200-option dropdown")
     except Exception as e:
         log(f"❌ Limit error: {e}")
 
@@ -163,27 +192,15 @@ async def scrape():
         await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(8000)
 
-        # Debug: log page title and all iframes found
         title = await page.title()
         log(f"Page title: {title}")
-        iframes = await page.locator("iframe").all()
-        log(f"Iframes found: {len(iframes)}")
-        for i, f in enumerate(iframes):
-            name = await f.get_attribute("name") or ""
-            src = await f.get_attribute("src") or ""
-            log(f"  iframe[{i}] name='{name}' src='{src[:80]}'")
 
-        # Save screenshot for debugging
         await page.screenshot(path="debug_screenshot.png", full_page=True)
-        log("Screenshot saved: debug_screenshot.png")
 
-        # Wait for iframe to appear in DOM, then give its content time to load
         await page.wait_for_selector('iframe[src*="opportunities.bidsandtenders.com"]', timeout=30000)
         await page.wait_for_timeout(5000)
 
         frame = page.frame_locator('iframe[src*="opportunities.bidsandtenders.com"]')
-
-        # Wait for table rows to be present inside the iframe
         await frame.locator("table tbody tr").first.wait_for(timeout=30000)
 
         await set_limit_to_200(frame, page)
@@ -195,9 +212,8 @@ async def scrape():
             log(f"\n--- Page {page_number} ---")
 
             rows = await frame.locator("table tbody tr").all()
-            log(f"Rows: {len(rows)}")
+            log(f"Rows on this page: {len(rows)}")
 
-            # 🔥 DUPLICATE PAGE DETECTION
             prev_first_row = await rows[0].inner_text() if rows else ""
 
             semaphore = asyncio.Semaphore(CONCURRENCY)
@@ -243,64 +259,50 @@ async def scrape():
 
             results = await asyncio.gather(*tasks)
             all_data.extend([r for r in results if r])
+            log(f"Total collected so far: {len(all_data)}")
 
             if page_number >= MAX_PAGES:
-                log("Reached MAX_PAGES")
+                log("Reached MAX_PAGES limit")
                 break
 
             try:
                 next_btn = frame.locator("a[aria-label='Next']")
-                if await next_btn.count() == 0:
+                count = await next_btn.count()
+                log(f"Next button count: {count}")
+
+                if count == 0:
+                    log("No next button — reached last page")
                     break
 
-                await next_btn.first.evaluate("el => el.click()")
-                await page.wait_for_timeout(4000)
+                await next_btn.first.click()
+                await page.wait_for_timeout(5000)
 
                 new_rows = await frame.locator("table tbody tr").all()
                 if new_rows:
                     new_first_row = await new_rows[0].inner_text()
                     if new_first_row == prev_first_row:
-                        log("Detected duplicate page → stopping")
+                        log("Duplicate page detected — stopping")
                         break
 
                 page_number += 1
 
-            except:
+            except Exception as e:
+                log(f"❌ Pagination error on page {page_number}: {e}")
                 break
 
         await browser.close()
 
-        df = pd.DataFrame(all_data)
-        df = df[df["Bid Classification"].str.contains("Services", case=False, na=False)]
+        log(f"Total scraped before filter: {len(all_data)}")
 
+        df = pd.DataFrame(all_data, columns=COLUMNS)
+        df = df[df["Bid Classification"].str.contains("Services", case=False, na=False)]
         log(f"Filtered rows (Services): {len(df)}")
 
-        # 🔥 ALWAYS SAVE LOCAL BACKUP
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        filename = f"bids_backup_{timestamp}.xlsx"
-        df.to_excel(filename, index=False)
-        log(f"💾 Local backup saved: {filename}")
-
-        # 🔥 GOOGLE SHEETS UPLOAD (SAFE)
         try:
             sheet = connect_gsheet()
-            existing_ids = get_existing_ids(sheet)
-
-            new_rows = []
-            for _, row in df.iterrows():
-                bid_id = str(row["Bid Number"])
-                if bid_id not in existing_ids:
-                    new_rows.append(row.values.tolist())
-
-            if new_rows:
-                sheet.append_rows(new_rows)
-                log(f"✅ Added {len(new_rows)} rows to Google Sheets")
-            else:
-                log("No new bids found")
-
+            upload_to_gsheet(sheet, df)
         except Exception as e:
             log(f"❌ Google Sheets upload failed: {e}")
-            log("Data محفوظ locally — no data loss ✅")
 
 
 asyncio.run(scrape())
