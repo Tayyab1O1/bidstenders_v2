@@ -41,7 +41,7 @@ def connect_gsheet():
     client = gspread.authorize(creds)
 
     # 🔥 PUT YOUR REAL SHEET ID HERE
-    sheet = client.open_by_key("1E91ZyuPWuUQYXdWrVMwlofGM8eLlNYCeBfrJj439mBE").bidsandtenders
+    sheet = client.open_by_key("1E91ZyuPWuUQYXdWrVMwlofGM8eLlNYCeBfrJj439mBE").worksheet("bidsandtenders")
     return sheet
 
 
