@@ -220,8 +220,6 @@ async def scrape():
             rows = await frame.locator("table tbody tr").all()
             log(f"Rows on this page: {len(rows)}")
 
-            prev_first_row = await rows[0].inner_text() if rows else ""
-
             semaphore = asyncio.Semaphore(CONCURRENCY)
 
             async def bounded(link, base):
@@ -281,15 +279,8 @@ async def scrape():
                     break
 
                 await next_btn.first.click()
+                await page.wait_for_timeout(3000)
                 await frame.locator("table tbody tr").first.wait_for(timeout=15000)
-                await page.wait_for_timeout(2000)
-
-                new_rows = await frame.locator("table tbody tr").all()
-                if new_rows:
-                    new_first_row = await new_rows[0].inner_text()
-                    if new_first_row == prev_first_row:
-                        log("Duplicate page detected — stopping")
-                        break
 
                 page_number += 1
 
