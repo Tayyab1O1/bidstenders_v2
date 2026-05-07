@@ -10,7 +10,7 @@ URL = "https://bidsandtenders.com/bid-opportunities/"
 LOG_FILE = "scraper_log.txt"
 
 CONCURRENCY = 8
-MAX_PAGES = 10
+MAX_PAGES = 35
 
 COLUMNS = [
     "Title", "Bid Number (List)", "Bid Name (List)", "Status (List)",
@@ -168,14 +168,16 @@ async def set_limit_to_200(frame, page):
         for i, dd in enumerate(dropdowns):
             options = await dd.locator("option").all_text_contents()
             log(f"  dropdown[{i}] options: {options}")
-            if any("200" in opt for opt in options):
-                opt_200 = next(opt for opt in options if "200" in opt)
-                await dd.select_option(label=opt_200.strip())
+            # Pick the highest available option
+            numeric_opts = [o.strip() for o in options if o.strip().isdigit()]
+            if numeric_opts:
+                highest = str(max(int(o) for o in numeric_opts))
+                await dd.select_option(label=highest)
                 await page.wait_for_timeout(4000)
                 await frame.locator("table tbody tr").first.wait_for(timeout=15000)
-                log("✅ Limit set to 200")
+                log(f"✅ Limit set to {highest}")
                 return
-        log("⚠️ Could not find 200-option dropdown")
+        log("⚠️ Could not find rows-per-page dropdown")
     except Exception as e:
         log(f"❌ Limit error: {e}")
 
@@ -270,15 +272,7 @@ async def scrape():
                 break
 
             try:
-                # Debug: log all pagination-related elements
-                if page_number == 1:
-                    pag_html = await frame.locator(".dataTables_paginate, .pagination, [class*='paginat']").all()
-                    log(f"Pagination containers: {len(pag_html)}")
-                    for el in pag_html:
-                        txt = await el.inner_text()
-                        log(f"  pagination text: {txt[:120]}")
-
-                next_btn = frame.locator("a[aria-label='Next'], li.next a, .paginate_button.next a, a.paginate_button.next")
+                next_btn = frame.locator('[aria-label="Next page"], button:has-text("›"), a:has-text("›")')
                 count = await next_btn.count()
                 log(f"Next button count: {count}")
 
