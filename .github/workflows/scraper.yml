@@ -29,8 +29,12 @@ jobs:
         run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
 
       - name: Write firebase-service-account.json
-        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT != '' }}
-        run: echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' > firebase-service-account.json
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -n "$FIREBASE_SA" ]; then
+            echo "$FIREBASE_SA" > firebase-service-account.json
+          fi
 
       - name: Run scraper
         run: python scraper.py
