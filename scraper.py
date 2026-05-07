@@ -148,11 +148,28 @@ async def scrape():
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
-        context = await browser.new_context()
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
         page = await context.new_page()
 
         log("Opening page...")
-        await page.goto(URL, wait_until="networkidle", timeout=60000)
+        await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(8000)
+
+        # Debug: log page title and all iframes found
+        title = await page.title()
+        log(f"Page title: {title}")
+        iframes = await page.locator("iframe").all()
+        log(f"Iframes found: {len(iframes)}")
+        for i, f in enumerate(iframes):
+            name = await f.get_attribute("name") or ""
+            src = await f.get_attribute("src") or ""
+            log(f"  iframe[{i}] name='{name}' src='{src[:80]}'")
+
+        # Save screenshot for debugging
+        await page.screenshot(path="debug_screenshot.png", full_page=True)
+        log("Screenshot saved: debug_screenshot.png")
 
         # Wait for iframe to appear in DOM, then give its content time to load
         await page.wait_for_selector('iframe[name="Bid Opportunities"]', timeout=30000)
