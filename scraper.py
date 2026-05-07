@@ -1,11 +1,19 @@
 import asyncio
 import json
+import os
 import pandas as pd
 from playwright.async_api import async_playwright
 import datetime
 import re
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials as fb_creds, firestore as fb_firestore
+    FIREBASE_AVAILABLE = True
+except ImportError:
+    FIREBASE_AVAILABLE = False
 
 URL = "https://bidsandtenders.com/bid-opportunities/"
 LOG_FILE = "scraper_log.txt"
@@ -36,6 +44,66 @@ def clean_text(text):
     if not text:
         return ""
     return re.sub(r'[\x00-\x1F\x7F]', '', text)
+
+
+# ---------------- FIRESTORE ----------------
+FIREBASE_SERVICE_ACCOUNT = "firebase-service-account.json"
+
+def connect_firestore():
+    if not FIREBASE_AVAILABLE:
+        log("⚠️  firebase-admin not installed — skipping Firestore upload")
+        return None
+    if not os.path.exists(FIREBASE_SERVICE_ACCOUNT):
+        log(f"⚠️  {FIREBASE_SERVICE_ACCOUNT} not found — skipping Firestore upload")
+        return None
+    if not firebase_admin._apps:
+        cred = fb_creds.Certificate(FIREBASE_SERVICE_ACCOUNT)
+        firebase_admin.initialize_app(cred)
+    return fb_firestore.client()
+
+
+def upload_to_firestore(db_client, df):
+    if db_client is None:
+        return
+    col = db_client.collection("bids")
+    added = 0
+    for _, row in df.iterrows():
+        bid_number = str(row.get("Bid Number", "")).strip()
+        if not bid_number:
+            continue
+        ref = col.document(bid_number)
+        if ref.get().exists:
+            continue
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        ref.set({
+            "title":           str(row.get("Title", "")),
+            "bidNumberList":   str(row.get("Bid Number (List)", "")),
+            "bidNameList":     str(row.get("Bid Name (List)", "")),
+            "statusList":      str(row.get("Status (List)", "")),
+            "postedDate":      str(row.get("Posted Date", "")),
+            "closingDateList": str(row.get("Closing Date (List)", "")),
+            "bidClassification": str(row.get("Bid Classification", "")),
+            "bidType":         str(row.get("Bid Type", "")),
+            "bidNumber":       bid_number,
+            "bidName":         str(row.get("Bid Name", "")),
+            "bidStatus":       str(row.get("Bid Status", "")),
+            "bidClosingDate":  str(row.get("Bid Closing Date (Detail)", "")),
+            "submissionType":  str(row.get("Submission Type", "")),
+            "submissionAddress": str(row.get("Submission Address", "")),
+            "publicOpening":   str(row.get("Public Opening", "")),
+            "description":     str(row.get("Description", "")),
+            "categories":      str(row.get("Categories", "")),
+            "reviewStatus":    "pending",
+            "aiScore":         None,
+            "aiScoreReason":   None,
+            "aiScoreHighlights": None,
+            "aiScoreConcerns": None,
+            "aiScoredAt":      None,
+            "createdAt":       now,
+            "updatedAt":       now,
+        })
+        added += 1
+    log(f"✅ Added {added} new bids to Firestore")
 
 
 # ---------------- GOOGLE SHEETS ----------------
@@ -308,6 +376,12 @@ async def scrape():
             upload_to_gsheet(sheet, df)
         except Exception as e:
             log(f"❌ Google Sheets upload failed: {e}")
+
+        try:
+            fs_client = connect_firestore()
+            upload_to_firestore(fs_client, df)
+        except Exception as e:
+            log(f"❌ Firestore upload failed: {e}")
 
 
 asyncio.run(scrape())
