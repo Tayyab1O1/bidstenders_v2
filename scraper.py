@@ -54,14 +54,15 @@ def connect_gsheet():
 def upload_to_gsheet(sheet, df):
     existing_values = sheet.get_all_values()
 
-    if not existing_values:
+    if not existing_values or existing_values[0] != COLUMNS:
+        # Sheet is empty or has wrong/old headers — write correct headers in row 1
+        sheet.clear()
         sheet.append_row(COLUMNS)
         existing_ids = set()
-        sheet_headers = COLUMNS
+        log("ℹ️ Sheet headers reset to correct column order")
     else:
-        sheet_headers = existing_values[0]
         try:
-            bid_col = sheet_headers.index("Bid Number")
+            bid_col = COLUMNS.index("Bid Number")
             existing_ids = set(
                 row[bid_col] for row in existing_values[1:]
                 if len(row) > bid_col and row[bid_col]
@@ -73,7 +74,7 @@ def upload_to_gsheet(sheet, df):
     for _, row in df.iterrows():
         bid_id = str(row.get("Bid Number", ""))
         if bid_id and bid_id not in existing_ids:
-            aligned = [str(row.get(h, "")) if h in df.columns else "" for h in sheet_headers]
+            aligned = [str(row.get(h, "")) for h in COLUMNS]
             new_rows.append(aligned)
 
     if new_rows:
@@ -163,10 +164,13 @@ async def set_limit_to_200(frame, page):
     try:
         await frame.locator("select").first.wait_for(timeout=10000)
         dropdowns = await frame.locator("select").all()
-        for dd in dropdowns:
+        log(f"Dropdowns found: {len(dropdowns)}")
+        for i, dd in enumerate(dropdowns):
             options = await dd.locator("option").all_text_contents()
-            if any(opt.strip() == "200" for opt in options):
-                await dd.select_option(label="200")
+            log(f"  dropdown[{i}] options: {options}")
+            if any("200" in opt for opt in options):
+                opt_200 = next(opt for opt in options if "200" in opt)
+                await dd.select_option(label=opt_200.strip())
                 await page.wait_for_timeout(4000)
                 await frame.locator("table tbody tr").first.wait_for(timeout=15000)
                 log("✅ Limit set to 200")
@@ -266,7 +270,15 @@ async def scrape():
                 break
 
             try:
-                next_btn = frame.locator("a[aria-label='Next']")
+                # Debug: log all pagination-related elements
+                if page_number == 1:
+                    pag_html = await frame.locator(".dataTables_paginate, .pagination, [class*='paginat']").all()
+                    log(f"Pagination containers: {len(pag_html)}")
+                    for el in pag_html:
+                        txt = await el.inner_text()
+                        log(f"  pagination text: {txt[:120]}")
+
+                next_btn = frame.locator("a[aria-label='Next'], li.next a, .paginate_button.next a, a.paginate_button.next")
                 count = await next_btn.count()
                 log(f"Next button count: {count}")
 
