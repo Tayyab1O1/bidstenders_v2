@@ -172,10 +172,10 @@ async def scrape():
         log("Screenshot saved: debug_screenshot.png")
 
         # Wait for iframe to appear in DOM, then give its content time to load
-        await page.wait_for_selector('iframe[name="Bid Opportunities"]', timeout=30000)
+        await page.wait_for_selector('iframe[src*="opportunities.bidsandtenders.com"]', timeout=30000)
         await page.wait_for_timeout(5000)
 
-        frame = page.frame_locator('iframe[name="Bid Opportunities"]')
+        frame = page.frame_locator('iframe[src*="opportunities.bidsandtenders.com"]')
 
         # Wait for table rows to be present inside the iframe
         await frame.locator("table tbody tr").first.wait_for(timeout=30000)
