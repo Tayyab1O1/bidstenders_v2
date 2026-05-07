@@ -281,7 +281,8 @@ async def scrape():
                     break
 
                 await next_btn.first.click()
-                await page.wait_for_timeout(5000)
+                await frame.locator("table tbody tr").first.wait_for(timeout=15000)
+                await page.wait_for_timeout(2000)
 
                 new_rows = await frame.locator("table tbody tr").all()
                 if new_rows:
