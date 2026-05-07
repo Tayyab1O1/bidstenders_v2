@@ -1,4 +1,5 @@
 import asyncio
+import json
 import pandas as pd
 from playwright.async_api import async_playwright
 import datetime
@@ -295,6 +296,12 @@ async def scrape():
         df = pd.DataFrame(all_data, columns=COLUMNS)
         df = df[df["Bid Classification"].str.contains("Services", case=False, na=False)]
         log(f"Filtered rows (Services): {len(df)}")
+
+        # Save JSON file
+        records = df.to_dict(orient="records")
+        with open("bids.json", "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        log(f"💾 JSON saved: bids.json ({len(records)} records)")
 
         try:
             sheet = connect_gsheet()
