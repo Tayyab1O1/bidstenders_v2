@@ -144,15 +144,25 @@ async def set_limit_to_200(frame, page):
 # ---------------- MAIN SCRAPER ----------------
 async def scrape():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        )
         context = await browser.new_context()
         page = await context.new_page()
 
         log("Opening page...")
-        await page.goto(URL)
+        await page.goto(URL, wait_until="networkidle", timeout=60000)
+
+        # Wait for iframe to appear in DOM, then give its content time to load
+        await page.wait_for_selector('iframe[name="Bid Opportunities"]', timeout=30000)
         await page.wait_for_timeout(5000)
 
         frame = page.frame_locator('iframe[name="Bid Opportunities"]')
+
+        # Wait for table rows to be present inside the iframe
+        await frame.locator("table tbody tr").first.wait_for(timeout=30000)
+
         await set_limit_to_200(frame, page)
 
         all_data = []
