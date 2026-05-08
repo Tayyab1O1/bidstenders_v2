@@ -101,13 +101,29 @@ export default function Dashboard() {
   const [updating, setUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const loadBids = useCallback(async () => {
-    setLoading(true);
+  const CACHE_KEY = 'bids_cache';
+
+  const loadBids = useCallback(async (force = false) => {
     setError(null);
+
+    if (!force) {
+      try {
+        const raw = sessionStorage.getItem(CACHE_KEY);
+        if (raw) {
+          setBids(JSON.parse(raw) as Bid[]);
+          setLoading(false);
+          return;
+        }
+      } catch {}
+    }
+
+    setLoading(true);
     try {
       const q = query(collection(db, 'bids'), orderBy('createdAt', 'desc'));
       const snap = await getDocs(q);
-      setBids(snap.docs.map(d => ({ id: d.id, ...d.data() } as Bid)));
+      const fetched = snap.docs.map(d => ({ id: d.id, ...d.data() } as Bid));
+      setBids(fetched);
+      try { sessionStorage.setItem(CACHE_KEY, JSON.stringify(fetched)); } catch {}
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -171,7 +187,7 @@ export default function Dashboard() {
           })
         )
       );
-      await loadBids();
+      await loadBids(true);
       setSelected(new Set());
     } catch (e: any) {
       setError(e.message);
@@ -190,7 +206,7 @@ export default function Dashboard() {
           updateDoc(doc(db, 'bids', id), { reviewStatus: status, updatedAt: now })
         )
       );
-      await loadBids();
+      await loadBids(true);
       setSelected(new Set());
     } catch (e: any) {
       setError(e.message);
@@ -266,7 +282,7 @@ export default function Dashboard() {
         </div>
 
         <button
-          onClick={loadBids}
+          onClick={() => loadBids(true)}
           className="ml-auto p-2 text-slate-500 border border-slate-200 rounded-lg hover:bg-slate-50 bg-white shadow-sm transition-colors"
           title="Refresh"
         >
