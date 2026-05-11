@@ -7,6 +7,8 @@ import { db } from '@/lib/firebase';
 import type { Bid, ReviewStatus } from '@/lib/types';
 
 type FilterTab = 'all' | ReviewStatus;
+type ScoreFilter = 'all' | 'high' | 'medium' | 'low' | 'unscored';
+type CloseDateFilter = 'all' | '7' | '14' | '30' | 'overdue';
 
 function DescriptionPopover({ description }: { description: string }) {
   const [open, setOpen] = useState(false);
@@ -96,6 +98,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState<FilterTab>('all');
+  const [scoreFilter, setScoreFilter] = useState<ScoreFilter>('all');
+  const [closeDateFilter, setCloseDateFilter] = useState<CloseDateFilter>('all');
   const [search, setSearch] = useState('');
   const [scoring, setScoring] = useState(false);
   const [updating, setUpdating] = useState(false);
@@ -135,13 +139,41 @@ export default function Dashboard() {
 
   const filtered = bids.filter(b => {
     const matchesTab = filter === 'all' || b.reviewStatus === filter;
+
     const q = search.toLowerCase();
     const matchesSearch =
       !q ||
       (b.bidName || b.bidNameList || '').toLowerCase().includes(q) ||
       (b.bidNumber || b.bidNumberList || '').toLowerCase().includes(q) ||
       (b.description || '').toLowerCase().includes(q);
-    return matchesTab && matchesSearch;
+
+    const score = b.aiScore ?? null;
+    const matchesScore =
+      scoreFilter === 'all' ? true
+      : scoreFilter === 'unscored' ? score === null
+      : scoreFilter === 'high' ? score !== null && score >= 80
+      : scoreFilter === 'medium' ? score !== null && score >= 60 && score < 80
+      : score !== null && score < 60;
+
+    let matchesCloseDate = true;
+    if (closeDateFilter !== 'all') {
+      const raw = b.closingDateList || b.bidClosingDate || '';
+      const closeDate = raw ? new Date(raw) : null;
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      if (!closeDate || isNaN(closeDate.getTime())) {
+        matchesCloseDate = false;
+      } else if (closeDateFilter === 'overdue') {
+        matchesCloseDate = closeDate < today;
+      } else {
+        const days = parseInt(closeDateFilter, 10);
+        const cutoff = new Date(today);
+        cutoff.setDate(cutoff.getDate() + days);
+        matchesCloseDate = closeDate >= today && closeDate <= cutoff;
+      }
+    }
+
+    return matchesTab && matchesSearch && matchesScore && matchesCloseDate;
   });
 
   const toggleSelect = (id: string) =>
@@ -280,6 +312,32 @@ export default function Dashboard() {
             </button>
           ))}
         </div>
+
+        <select
+          value={scoreFilter}
+          onChange={e => setScoreFilter(e.target.value as ScoreFilter)}
+          className="py-2 pl-3 pr-7 text-sm text-slate-700 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white shadow-sm appearance-none cursor-pointer"
+          style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2394a3b8'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'/%3E%3C/svg%3E")`, backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.5rem center', backgroundSize: '1rem' }}
+        >
+          <option value="all">All Scores</option>
+          <option value="high">High (≥ 80)</option>
+          <option value="medium">Medium (60–79)</option>
+          <option value="low">Low (&lt; 60)</option>
+          <option value="unscored">Unscored</option>
+        </select>
+
+        <select
+          value={closeDateFilter}
+          onChange={e => setCloseDateFilter(e.target.value as CloseDateFilter)}
+          className="py-2 pl-3 pr-7 text-sm text-slate-700 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white shadow-sm appearance-none cursor-pointer"
+          style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2394a3b8'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'/%3E%3C/svg%3E")`, backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.5rem center', backgroundSize: '1rem' }}
+        >
+          <option value="all">All Dates</option>
+          <option value="7">Closes in 7 days</option>
+          <option value="14">Closes in 14 days</option>
+          <option value="30">Closes in 30 days</option>
+          <option value="overdue">Overdue</option>
+        </select>
 
         <button
           onClick={() => loadBids(true)}
