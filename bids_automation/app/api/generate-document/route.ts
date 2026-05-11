@@ -51,7 +51,7 @@ Write a complete, professional, and compelling proposal in Markdown format. Stru
 CRITICAL: Use "${companyName}" throughout. Never write [Company Name], [Your Company], or any placeholder. All details are provided — use them directly.`;
 
   try {
-    const content = await chat(prompt, 2500);
+    const content = await chat(prompt, 8000);
     return Response.json({ content });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });

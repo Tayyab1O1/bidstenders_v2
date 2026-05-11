@@ -34,7 +34,7 @@ Refinement instructions: ${instructions}
 Return the complete refined proposal in Markdown format. Apply the requested changes while keeping the overall professional structure intact. Do not add commentary about what you changed.`;
 
   try {
-    const refined = await chat(prompt, 2500);
+    const refined = await chat(prompt, 8000);
     return Response.json({ content: refined });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });
